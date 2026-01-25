@@ -11,6 +11,7 @@
 
 import os
 import numpy as np
+import copy
 import torch
 import random
 import matplotlib.pyplot as plt
@@ -32,7 +33,9 @@ from utils.camera_utils import gen_idu_orbit_camera, cameraList_from_camInfos
 from scene.dataset_readers import CameraInfo
 
 from PIL import Image
-from submodules.MoGe.idu_depth import MoGeIDU
+# from submodules.MoGe.idu_depth import MoGeIDU
+
+from submodules.FoundationStereo.stereo_depth import FoundationStereoDepth
 
 # pip install diffusers==0.30.1 huggingface-hub==0.33.4 transformers==4.46.3 tokenizers==0.20.3 (default)
 from submodules.FlowEdit.idu_refine import FlowEditRefineIDU 
@@ -55,10 +58,17 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 os.makedirs("./depth_tmp", exist_ok=True)
-moge_standalone = MoGeIDU(
-    "./depth_tmp",
-    "cuda:0",
-    60.0
+# moge_standalone = MoGeIDU(
+#     "./depth_tmp",
+#     "cuda:0",
+#     60.0
+# )
+foundation_stereo_model = FoundationStereoDepth(
+    ckpt_dir="/root/autodl-tmp/Skyfall-GS/submodules/FoundationStereo/pretrained_models/23-51-11/model_best_bp2.pth",
+    device="cuda:0",
+    scale=0.5,
+    hiera=False,
+    save_path="./depth_tmp"
 )
 
 @torch.no_grad()
@@ -180,7 +190,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Pick a random high resolution camera
         if random.random() < 0.3 and dataset.sample_more_highres:
             viewpoint_cam = trainCameras[highresolution_index[randint(0, len(highresolution_index)-1)]]
-            
+
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
@@ -242,6 +252,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss += opt.lambda_opacity * opacity_loss
 
 
+        # if opt.lambda_pseudo_depth > 0 and iteration % opt.sample_pseudo_interval == 0 and iteration > opt.start_sample_pseudo and iteration < opt.end_sample_pseudo:
+        #     if not pseudo_stack:
+        #         # sample elevation from 80 to 45
+        #         elevation = (opt.end_sample_pseudo - iteration) / (opt.end_sample_pseudo - opt.start_sample_pseudo) * (80 - 45) + 45
+        #         # For Satellite
+        #         radius = (opt.end_sample_pseudo - iteration) / (opt.end_sample_pseudo - opt.start_sample_pseudo) * (300 - 250) + 250
+        #         # For GES
+        #         # radius = (opt.end_sample_pseudo - iteration) / (opt.end_sample_pseudo - opt.start_sample_pseudo) * (100 - 50) + 50
+        #         pseudo_stack = generate_pseudo_cams(dataset, opt.num_pseudo_cams, num_train_cams, elevation, radius, target_std=opt.target_std)
+            
+        #     pseudo_cam = pseudo_stack.pop(randint(0, len(pseudo_stack) - 1))
+        #     render_pkg = render(
+        #         pseudo_cam, 
+        #         gaussians, 
+        #         pipe, 
+        #         background, 
+        #         kernel_size=dataset.kernel_size, 
+        #         subpixel_offset=subpixel_offset
+        #     )
+        #     render_image, render_depth = render_pkg["render"], render_pkg["render_depth"]
+            
+        #     render_image_pil = to_pil_image(render_image)
+        #     moge_depth = moge_standalone.run([render_image_pil], pbar=False)[0]
+        #     gt_depth = torch.tensor(moge_depth).to(render_depth.device)
+
         if opt.lambda_pseudo_depth > 0 and iteration % opt.sample_pseudo_interval == 0 and iteration > opt.start_sample_pseudo and iteration < opt.end_sample_pseudo:
             if not pseudo_stack:
                 # sample elevation from 80 to 45
@@ -252,24 +287,90 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 # radius = (opt.end_sample_pseudo - iteration) / (opt.end_sample_pseudo - opt.start_sample_pseudo) * (100 - 50) + 50
                 pseudo_stack = generate_pseudo_cams(dataset, opt.num_pseudo_cams, num_train_cams, elevation, radius, target_std=opt.target_std)
             
-            pseudo_cam = pseudo_stack.pop(randint(0, len(pseudo_stack) - 1))
-            render_pkg = render(
-                pseudo_cam, 
-                gaussians, 
-                pipe, 
-                background, 
-                kernel_size=dataset.kernel_size, 
-                subpixel_offset=subpixel_offset
-            )
-            render_image, render_depth = render_pkg["render"], render_pkg["render_depth"]
+            # --- 1. 获取左相机 (原始伪相机) ---
+            left_cam = pseudo_stack.pop(randint(0, len(pseudo_stack) - 1))
             
-            render_image_pil = to_pil_image(render_image)
-            moge_depth = moge_standalone.run([render_image_pil], pbar=False)[0]
-            gt_depth = torch.tensor(moge_depth).to(render_depth.device)
+            # --- 2. 动态生成右相机 (构建双目对) ---
+            # 计算基线：根据相机距离(radius)动态设定距离的 5% (根据场景尺度调整系数 0.05)
+            # 如果 radius 变量在当前作用域不可用，可以用 torch.norm(left_cam.camera_center) 计算
+            current_radius = torch.norm(left_cam.camera_center).item()
+            baseline = current_radius * 0.05 
+            
+            right_cam = copy.deepcopy(left_cam)
+            
+            # 修改右相机的外参：在视图空间向右移动 (即世界向左移动)
+            # 3DGS 通常使用转置的 world_view_transform (4x4), [3, 0] 对应 X 轴平移
+            w2c = right_cam.world_view_transform.clone()
+            w2c[3, 0] -= baseline # 视图矩阵 X 平移减去基线
+            right_cam.world_view_transform = w2c
+            # 更新相关的投影矩阵和相机中心
+            right_cam.full_proj_transform = (right_cam.world_view_transform.unsqueeze(0).bmm(right_cam.projection_matrix.unsqueeze(0))).squeeze(0)
+            right_cam.camera_center = right_cam.world_view_transform.inverse()[3, :3]
 
-            gt_depth = gt_depth.reshape(-1, 1)
-            render_depth = render_depth.reshape(-1, 1)
-            depth_loss_pseudo = depth_loss_func(gt_depth, render_depth)
+            # --- 3. 渲染左右视图 ---
+            # 渲染左图
+            render_pkg_left = render(left_cam, gaussians, pipe, background, kernel_size=dataset.kernel_size, subpixel_offset=subpixel_offset)
+            # 渲染右图 (只需要 RGB)
+            render_pkg_right = render(right_cam, gaussians, pipe, background, kernel_size=dataset.kernel_size, subpixel_offset=subpixel_offset)
+            
+            image_left_tensor = render_pkg_left["render"]
+            image_right_tensor = render_pkg_right["render"]
+            render_depth = render_pkg_left["render_depth"] # 我们监督左视图的深度
+
+            # --- 4. 准备 FoundationStereo 输入 ---
+
+            # 转换为 Numpy (H, W, 3), 范围 [0, 255], uint8
+            img_left_np = (image_left_tensor.permute(1, 2, 0).detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+            img_right_np = (image_right_tensor.permute(1, 2, 0).detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+
+            # --- 5. 自动获取内参 K ---
+            # 根据左相机的 FOV 和分辨率计算焦距
+            W = left_cam.image_width
+            H = left_cam.image_height
+            fovx = left_cam.FoVx
+            fovy = left_cam.FoVy
+            
+            fx = W / (2 * np.tan(fovx / 2))
+            fy = H / (2 * np.tan(fovy / 2))
+            cx = W / 2
+            cy = H / 2
+            
+            K = np.array([[fx, 0, cx], 
+                          [0, fy, cy], 
+                          [0, 0, 1]], dtype=np.float32)
+
+            # --- 6. 运行双目深度估计 ---
+            # 传入动态计算的 K 和 baseline
+            foundation_stereo_model.intrinsics = (K, baseline)
+            
+            # 获取预测深度
+            pred_depth_np = foundation_stereo_model.run(img_left_np, img_right_np, remove_invisible=True)
+            import cv2
+            target_size = (1024, 1024)
+            pred_depth_np = cv2.resize(
+                pred_depth_np, 
+                target_size, 
+                interpolation=cv2.INTER_LINEAR  
+            )
+            # --- 7. 计算 Loss ---
+            gt_depth = torch.from_numpy(pred_depth_np).to(render_depth.device).float()
+            
+            # 处理可能的无效值 (inf/nan)
+            valid_mask = torch.isfinite(gt_depth) & (gt_depth > 0)
+            
+            if valid_mask.sum() > 10: # 确保有足够的有效像素
+                gt_depth = gt_depth.reshape(-1, 1)
+                render_depth = render_depth.reshape(-1, 1)
+                valid_mask = valid_mask.reshape(-1, 1)
+                
+                # 只计算有效像素的 Loss
+                depth_loss_pseudo = depth_loss_func(gt_depth[valid_mask], render_depth[valid_mask])
+            else:
+                depth_loss_pseudo = 0.0
+
+            # gt_depth = gt_depth.reshape(-1, 1)
+            # render_depth = render_depth.reshape(-1, 1)
+            # depth_loss_pseudo = depth_loss_func(gt_depth, render_depth)
 
             if torch.isnan(depth_loss_pseudo).sum() == 0:
                 loss_scale = min((iteration - args.start_sample_pseudo) / 500., 1)
@@ -494,13 +595,53 @@ def generate_idu_training_set(
 
     depth_path = os.path.join(dataset.model_path, "idu", f"e{elevation}_r{radius}", "render_depth")
     os.makedirs(depth_path, exist_ok=True)
-    moge = MoGeIDU(
-        depth_path,
-        device = "cuda:0",
-        fov_x=fov_x
+    # moge = MoGeIDU(
+    #     depth_path,
+    #     device = "cuda:0",
+    #     fov_x=fov_x
+    # )
+    # depths = moge.run(final_imgs)
+    foundationstereo = FoundationStereoDepth(
+        "/root/autodl-tmp/Skyfall-GS/submodules/FoundationStereo/pretrained_models/23-51-11/model_best_bp2.pth",
+        "cuda:0",
+        0.5,
+        False,
+        depth_path
     )
-    depths = moge.run(final_imgs)
+    depths = []
+    for idx, (cam_info, img) in enumerate(zip(idu_cam_infos, final_imgs)):
+        left_cam = cam_info
+        right_cam = copy.deepcopy(left_cam)
+        current_radius = torch.norm(torch.tensor(left_cam.T)).item()  
+        baseline = current_radius * 0.05 
+        w2c = torch.eye(4)
+        w2c[:3, :3] = torch.tensor(left_cam.R).T  # 旋转矩阵转置（世界转相机）
+        w2c[:3, 3] = torch.tensor(left_cam.T)     # 平移向量
+        w2c[3, 0] -= baseline                    # X轴平移减去基线
+        right_cam.R = w2c[:3, :3].T.numpy()      # 还原相机旋转矩阵
+        right_cam.T = w2c[:3, 3].numpy()         # 还原相机平移向量
+        # 构建右相机的 cam_info 并渲染
+        right_cam_info = CameraInfo(
+            uid=cam_info.uid + "_right", R=right_cam.R, T=right_cam.T,
+            FovY=cam_info.FovY, FovX=cam_info.FovX,
+            cx=0, cy=0, width=cam_info.width, height=cam_info.height,
+            image=None, image_path="", image_name=""
+        )
+        right_cam_list = cameraList_from_camInfos([right_cam_info], 1, dataset, is_pseudo_cam=idu_random_ap)
+        right_img = render_idu_set(right_cam_list, gaussians, pipeline, background, kernel_size, idu_random_ap)[0]
 
+        img_left_np = (np.array(img) * 255).clip(0, 255).astype(np.uint8)
+        img_right_np = (right_img * 255 + 0.5).clip(0, 255).astype(np.uint8)
+
+        W, H = cam_info.width, cam_info.height
+        fx = W / (2 * np.tan(np.deg2rad(cam_info.FovX) / 2))
+        fy = H / (2 * np.tan(np.deg2rad(cam_info.FovY) / 2))
+        cx, cy = W / 2, H / 2
+        K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
+        
+        foundationstereo.intrinsics = (K, baseline)
+        pred_depth = foundationstereo.run(img_left_np, img_right_np, remove_invisible=True)
+        depths.append(pred_depth)
 
     final_idu_cam_infos = []
     # Save to cam_infos
@@ -518,7 +659,7 @@ def generate_idu_training_set(
 
     final_cam_lists = cameraList_from_camInfos(final_idu_cam_infos, 1, dataset, is_idu=True, is_pseudo_cam=idu_random_ap)
         
-    del moge
+    del foundationstereo
     del gaussians
     torch.cuda.empty_cache()
 
@@ -807,24 +948,107 @@ def training_idu_episode(
 
                 pseudo_stack = generate_pseudo_cams(dataset, opt.num_pseudo_cams, num_train_cams, elevation, radius)
             
-            pseudo_cam = pseudo_stack.pop(randint(0, len(pseudo_stack) - 1))
-            render_pkg = render(
-                pseudo_cam, 
-                gaussians, 
-                pipe, 
-                background, 
-                kernel_size=dataset.kernel_size, 
-                subpixel_offset=subpixel_offset
-            )
-            render_image, render_depth = render_pkg["render"], render_pkg["render_depth"]
+            # pseudo_cam = pseudo_stack.pop(randint(0, len(pseudo_stack) - 1))
+            # render_pkg = render(
+            #     pseudo_cam, 
+            #     gaussians, 
+            #     pipe, 
+            #     background, 
+            #     kernel_size=dataset.kernel_size, 
+            #     subpixel_offset=subpixel_offset
+            # )
+            # render_image, render_depth = render_pkg["render"], render_pkg["render_depth"]
             
-            render_image_pil = to_pil_image(render_image)
-            moge_depth = moge_standalone.run([render_image_pil], pbar=False)[0]
-            gt_depth = torch.tensor(moge_depth).to(render_depth.device)
+            # render_image_pil = to_pil_image(render_image)
+            # moge_depth = moge_standalone.run([render_image_pil], pbar=False)[0]
+            # gt_depth = torch.tensor(moge_depth).to(render_depth.device)
 
-            gt_depth = gt_depth.reshape(-1, 1)
-            render_depth = render_depth.reshape(-1, 1)
-            depth_loss_pseudo = depth_loss_func(gt_depth, render_depth)
+            # gt_depth = gt_depth.reshape(-1, 1)
+            # render_depth = render_depth.reshape(-1, 1)
+            # depth_loss_pseudo = depth_loss_func(gt_depth, render_depth)
+
+            
+            # --- 1. 获取左相机 (原始伪相机) ---
+            left_cam = pseudo_stack.pop(randint(0, len(pseudo_stack) - 1))
+            
+            # --- 2. 动态生成右相机 (构建双目对) ---
+            # 计算基线：根据相机距离(radius)动态设定，例如距离的 5% (根据场景尺度调整系数 0.05)
+            # 如果 radius 变量在当前作用域不可用，可以用 torch.norm(left_cam.camera_center) 计算
+            current_radius = torch.norm(left_cam.camera_center).item()
+            baseline = current_radius * 0.05 
+            
+            right_cam = copy.deepcopy(left_cam)
+            
+            # 修改右相机的外参：在视图空间向右移动 (即世界向左移动)
+            # 3DGS 通常使用转置的 world_view_transform (4x4), [3, 0] 对应 X 轴平移
+            w2c = right_cam.world_view_transform.clone()
+            w2c[3, 0] -= baseline # 视图矩阵 X 平移减去基线
+            right_cam.world_view_transform = w2c
+            # 更新相关的投影矩阵和相机中心
+            
+            right_cam.full_proj_transform = (right_cam.world_view_transform.unsqueeze(0).bmm(right_cam.projection_matrix.unsqueeze(0))).squeeze(0)
+            right_cam.camera_center = right_cam.world_view_transform.inverse()[3, :3]
+
+            # --- 3. 渲染左右视图 ---
+            # 渲染左图
+            render_pkg_left = render(left_cam, gaussians, pipe, background, kernel_size=dataset.kernel_size, subpixel_offset=subpixel_offset)
+            # 渲染右图 (只需要 RGB)
+            render_pkg_right = render(right_cam, gaussians, pipe, background, kernel_size=dataset.kernel_size, subpixel_offset=subpixel_offset)
+            
+            image_left_tensor = render_pkg_left["render"]
+            image_right_tensor = render_pkg_right["render"]
+            render_depth = render_pkg_left["render_depth"] # 我们监督左视图的深度
+
+            # --- 4. 准备 FoundationStereo 输入 ---
+            # 转换为 Numpy (H, W, 3), 范围 [0, 255], uint8
+            img_left_np = (image_left_tensor.permute(1, 2, 0).detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+            img_right_np = (image_right_tensor.permute(1, 2, 0).detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+
+            # --- 5. 自动获取内参 K ---
+            # 根据左相机的 FOV 和分辨率计算焦距
+            W = left_cam.image_width
+            H = left_cam.image_height
+            fovx = left_cam.FoVx
+            fovy = left_cam.FoVy
+            
+            fx = W / (2 * np.tan(fovx / 2))
+            fy = H / (2 * np.tan(fovy / 2))
+            cx = W / 2
+            cy = H / 2
+            
+            K = np.array([[fx, 0, cx], 
+                          [0, fy, cy], 
+                          [0, 0, 1]], dtype=np.float32)
+
+            # --- 6. 运行双目深度估计 ---
+            # 传入动态计算的 K 和 baseline
+            foundation_stereo_model.intrinsics = (K, baseline)
+            
+            # 获取预测深度
+            pred_depth_np = foundation_stereo_model.run(img_left_np, img_right_np, remove_invisible=True)
+            import cv2
+            target_size = (1024, 1024)
+            pred_depth_np = cv2.resize(
+                pred_depth_np, 
+                target_size, 
+                interpolation=cv2.INTER_LINEAR  
+            )
+            
+            # --- 7. 计算 Loss ---
+            gt_depth = torch.from_numpy(pred_depth_np).to(render_depth.device).float()
+            
+            # 处理可能的无效值 (inf/nan)
+            valid_mask = torch.isfinite(gt_depth) & (gt_depth > 0)
+            
+            if valid_mask.sum() > 10: # 确保有足够的有效像素
+                gt_depth = gt_depth.reshape(-1, 1)
+                render_depth = render_depth.reshape(-1, 1)
+                valid_mask = valid_mask.reshape(-1, 1)
+                
+                # 只计算有效像素的 Loss
+                depth_loss_pseudo = depth_loss_func(gt_depth[valid_mask], render_depth[valid_mask])
+            else:
+                depth_loss_pseudo = 0.0
 
             if torch.isnan(depth_loss_pseudo).sum() == 0:
                 loss_scale = 1.0
