@@ -13,3 +13,6 @@
 [submodule "submodules/simple-knn"]
 	path = submodules/simple-knn
 	url = https://github.com/camenduru/simple-knn.git
+[submodule "submodules/FoundationStereo"]
+	path = submodules/FoundationStereo
+	url = https://cccccccccccccccccccccccccccccccccccccccccccccccccccc.cc/https://github.com/huahuaxew/FoundationStereo.git
